@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+"""uvicorn entrypoint: ``uv run uvicorn main:app``."""
+from app.main import app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
