@@ -25,6 +25,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.context import REQUEST_ID_HEADER, get_request_id, set_request_id
 from app.observability.logging import get_logger, redact_value, sanitize_headers
+from app.observability.sensitive import scrub_validation_errors
 
 logger = get_logger("app.errors")
 
@@ -95,13 +96,20 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        # 仅回传字段位置与类型/规则信息；校验消息中的输入值由 pydantic 提供，
-        # 这里统一走脱敏，避免原始输入（可能含敏感值）出现在响应与日志中。
-        errors = redact_value(exc.errors())
+        # 统一清洗一次：保留字段定位(loc)/失败规则(type)/稳定错误类别
+        # (error_category)，敏感字段输入掩码、非敏感字段输入保留；
+        # 响应与内部日志使用【同一份】清洗结果，保证各处判定完全一致，
+        # 且掩码只计一次（response 通道）。资料策略由入口中间件按路由通过
+        # ContextVar 绑定；无策略（如 /login）时退回全局凭据规则。
+        errors = scrub_validation_errors(exc.errors())
         request_id = _effective_request_id(request)
         logger.warning(
             "request validation failed",
-            extra={"request_ctx": _safe_request_context(request), "validation_errors": errors},
+            extra={
+                "request_ctx": _safe_request_context(request),
+                "profile": getattr(request.state, "sensitive_profile", None),
+                "validation_errors": errors,
+            },
         )
         request.state.error_code = CODE_VALIDATION
         body = _error_body(

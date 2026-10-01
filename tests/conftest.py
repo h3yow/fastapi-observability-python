@@ -1,7 +1,7 @@
 """测试公共夹具与断言辅助。
 
-* 每个用例前后隔离全局指标；
-* 下游 HTTP 全部走 MockTransport，可模拟成功/失败并捕获透传请求头；
+* 每个用例前后隔离全局指标（HTTP 指标 + 脱敏审计计数）；
+* 下游 HTTP 全部走 MockTransport，可模拟成功/失败并捕获透传请求头/请求体；
 * 提供日志捕获 handler，便于断言“某条日志在特定 request_id 下出现/不含敏感值”；
 * client 关闭 raise_server_exceptions，使 500 处理器的响应可断言。
 """
@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.observability import http as http_mod
+from app.observability.audit import reset_audit
 from app.observability.logging import JsonFormatter, RequestIdFilter
 from app.observability.metrics import reset_metrics
 
@@ -59,10 +60,13 @@ def log_capture() -> Iterator[LogCapture]:
 @pytest.fixture
 def client(log_capture: LogCapture) -> Iterator[TestClient]:
     reset_metrics()
+    reset_audit()
 
     requests_seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        # 缓存请求体（content 是字节，可反复读取），供用例断言下游未收到敏感值。
+        _ = request.content
         requests_seen.append(request)
         if str(request.url).endswith("/fail"):
             return httpx.Response(500, json={"detail": "downstream secret stack"})

@@ -1,18 +1,22 @@
-"""request_id 与请求指标采集中间件。
+"""request_id、资料敏感策略与请求指标采集中间件。
 
 执行顺序（该中间件是最外层 HTTP 中间件）：
 
 1. 读取入站 ``X-Request-ID``，按 :func:`app.context.resolve_request_id`
    的确定规则沿用或替换，并写入 ContextVar；
-2. 将生效标识写回响应头 ``X-Request-ID``（异常响应同样可关联）；
-3. ``try/finally`` 中计时并调用 :func:`observe_request`，正常响应、
+2. 按请求路径匹配已注册的**路由模板 -> 资料敏感策略**，命中则把策略写入
+   ContextVar：路由处理、422 异常处理器、后台任务、下游调用记录以及 JSON
+   日志在同一个请求内读到的是同一份声明，敏感判定各处口径一致；
+3. 将生效标识写回响应头 ``X-Request-ID``（异常响应同样可关联）；
+4. ``try/finally`` 中计时并调用 :func:`observe_request`，正常响应、
    校验失败、未匹配路由、内部异常全部走同一条采集路径，口径一致；
-4. 路由维度使用模板（``request.scope["route"]``），未匹配路由统一归为
+5. 路由维度使用模板（``request.scope["route"]``），未匹配路由统一归为
    :data:`UNMATCHED_ROUTE`，杜绝高基数。
 """
 
 from __future__ import annotations
 
+import re
 import time
 
 from fastapi import FastAPI, Request
@@ -28,6 +32,12 @@ from app.context import (
 from app.observability.errors import CODE_INTERNAL, register_exception_handlers
 from app.observability.logging import configure_logging, get_logger
 from app.observability.metrics import UNMATCHED_ROUTE, observe_request, render_prometheus
+from app.observability import audit as audit_mod
+from app.observability.sensitive import (
+    SensitivePolicy,
+    reset_active_policy,
+    set_active_policy,
+)
 
 logger = get_logger("app.access")
 
@@ -42,6 +52,32 @@ _STATUS_FALLBACK_CODE = {
     502: "DOWNSTREAM_ERROR",
     503: "SERVICE_UNAVAILABLE",
 }
+
+# ---------------------------------------------------------------------------
+# 路由模板 -> 资料敏感策略注册表
+# ---------------------------------------------------------------------------
+#: 编译后的路由模板正则（形如 /enterprise/onboarding），与路由表模板一致。
+_TEMPLATE_PARAM = re.compile(r"{[^{}]+}")
+#: (编译后模板正则, 原始模板, 策略)
+_policy_routes: list[tuple[re.Pattern[str], str, SensitivePolicy]] = []
+
+
+def register_route_policy(route_template: str, policy: SensitivePolicy) -> None:
+    """登记“路由模板 -> 资料敏感策略”。
+
+    资料场景通过本函数声明自己的模板与策略；新增资料版本只改场景自己的
+    模型/声明文件并在此登记，公共脱敏代码无需改动。
+    """
+    pattern = _TEMPLATE_PARAM.sub(r"[^/]+", route_template)
+    compiled = re.compile(f"^{pattern}$")
+    _policy_routes.append((compiled, route_template, policy))
+
+
+def _match_policy(path: str) -> SensitivePolicy | None:
+    for compiled, _template, policy in _policy_routes:
+        if compiled.match(path):
+            return policy
+    return None
 
 
 def _route_template(request: Request) -> str:
@@ -72,6 +108,17 @@ def install_observability(app: FastAPI) -> None:
         # ServerErrorMiddleware，ContextVar 无法回传，state 可被其读取。
         request.state.request_id = request_id
         request.state.request_id_source = source
+
+        # 按路由模板绑定本请求的资料敏感策略（同一请求内的路由/422 处理器/
+        # 后台任务/下游记录/JSON 日志共享同一份声明；未登记路由为 None，
+        # 退回全局凭据规则）。
+        policy = _match_policy(request.url.path)
+        if policy is not None:
+            policy_token = set_active_policy(policy)
+            request.state.sensitive_profile = policy.name
+        else:
+            policy_token = set_active_policy(None)
+            request.state.sensitive_profile = None
 
         start = time.perf_counter()
         status_code = 500
@@ -116,11 +163,15 @@ def install_observability(app: FastAPI) -> None:
                     "duration_ms": round(duration * 1000, 3),
                     "request_id_source": source,
                     "error_code": error_code,
+                    "sensitive_profile": request.state.sensitive_profile,
                     "effective_request_id": get_request_id(),
                 },
             )
+            reset_active_policy(policy_token)
             reset_request_id()
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics_endpoint() -> Response:
-        return Response(content=render_prometheus(), media_type="text/plain; version=0.0.4")
+        # HTTP 指标 + 脱敏审计计数同一端点暴露；审计指标仅含低基数标签。
+        content = render_prometheus() + audit_mod.render_audit_prometheus()
+        return Response(content=content, media_type="text/plain; version=0.0.4")

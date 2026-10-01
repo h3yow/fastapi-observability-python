@@ -17,13 +17,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.context import get_request_id
+from app.observability.sensitive import CHANNEL_LOG, RedactedPayload, redact_with_policy
 
 #: 脱敏后替换值（固定值，避免泄露长度等信息）。
 REDACTED = "***REDACTED***"
 
-#: 命中即脱敏的字段名（子串、大小写不敏感匹配）。
-#: 覆盖凭据/令牌：password/passwd、secret、token、api_key、authorization、credential；
-#: 覆盖个人敏感信息：id_card/idcard、phone/mobile、email、ssn。
+#: 仅用于 HTTP 头脱敏的凭据/个人信息匹配（结构化字段的脱敏统一走
+#: app.observability.sensitive，按当前请求绑定的资料声明判定）。
 import re
 
 _SENSITIVE_PATTERN = re.compile(
@@ -32,9 +32,8 @@ _SENSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-#: 递归深度与容器规模上限，防止异常数据导致日志采集失控。
-_MAX_DEPTH = 6
-_MAX_ITEMS = 100
+#: 递归深度/每层元素上限由 app.observability.sensitive 的脱敏内核统一约束，
+#: 此处不再单独维护，避免两套限额口径漂移。
 
 #: logging 记录自带的标准属性，渲染 extra 字段时排除。
 _RESERVED_ATTRS = frozenset(
@@ -48,55 +47,31 @@ _RESERVED_ATTRS = frozenset(
 
 
 def _is_sensitive_key(key: Any) -> bool:
-    """判断字段名是否属于敏感字段。"""
+    """判断字段名是否属于敏感字段（仅供 sanitize_headers 等头场景使用）。"""
     if not isinstance(key, str):
         return False
     return bool(_SENSITIVE_PATTERN.search(key))
 
 
-def redact_value(value: Any, depth: int = 0) -> Any:
-    """对任意值做递归脱敏。
+def redact_value(value: Any) -> Any:
+    """对任意值做递归脱敏（兼容既有调用的统一入口薄封装）。
 
-    dict 的敏感键整体替换为 :data:`REDACTED`；非敏感键递归处理。
-    list/tuple/set 的元素递归处理；Pydantic 模型按 ``model_dump`` 展开。
-    其余标量原样返回（字符串是否脱敏取决于其所属键名）。
+    脱敏判定完全委托 :func:`app.observability.sensitive.redact_with_policy`：
+
+    * 当前请求上下文绑定了资料策略（如企业开通）时，按路径化声明判定，
+      同名字段在不同子结构可有不同级别，数组/别名/可选分支均覆盖；
+    * 未绑定策略时（如 /login），退化为全局凭据/个人信息模式，
+      与本函数历史行为完全一致；
+    * 掩码事件按 ``log`` 通道计入脱敏审计，日志通道的 error_category 恒空。
 
     >>> redact_value({"password": "p@ss", "user": {"token": "t", "id": 1}})
     {'password': '***REDACTED***', 'user': {'token': '***REDACTED***', 'id': 1}}
     >>> redact_value([{"api_key": "k"}, "ok"])
     [{'api_key': '***REDACTED***'}, 'ok']
     """
-    if depth >= _MAX_DEPTH:
-        return REDACTED
-
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for i, (key, item) in enumerate(value.items()):
-            if i >= _MAX_ITEMS:
-                result["...truncated"] = True
-                break
-            if _is_sensitive_key(key):
-                result[str(key)] = REDACTED
-            else:
-                result[str(key)] = redact_value(item, depth + 1)
-        return result
-
-    if hasattr(value, "model_dump") and callable(value.model_dump):
-        try:
-            return redact_value(value.model_dump(), depth + 1)
-        except Exception:
-            return "<unserializable>"
-
-    if isinstance(value, list | tuple | set | frozenset):
-        seq = list(value)[:_MAX_ITEMS]
-        redacted = [redact_value(item, depth + 1) for item in seq]
-        if isinstance(value, tuple):
-            return tuple(redacted)
-        if isinstance(value, set | frozenset):
-            return set(redacted)
-        return redacted
-
-    return value
+    return redact_with_policy(
+        value, channel=CHANNEL_LOG, error_category="", count=True
+    )
 
 
 def sanitize_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -135,7 +110,19 @@ class JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key in _RESERVED_ATTRS or key in payload:
                 continue
-            payload[key] = redact_value(value)
+            # 已经在输出动作处脱敏过的成品载荷：原样记录，不再二次计数。
+            if isinstance(value, RedactedPayload):
+                payload[key] = value.payload
+                continue
+            # 同一条 LogRecord 的所有 extra 共享一次审计计数：
+            # redact_with_policy 内部 model_dump 会先脱敏一次 Pydantic 模型，
+            # 这里再对返回结果脱敏一次（保证容器级兜底），用 record 标记去重，
+            # 避免同一敏感值被计两次。
+            if getattr(record, "_audit_counted", False):
+                payload[key] = redact_with_policy(value, count=False)
+            else:
+                payload[key] = redact_value(value)
+        record._audit_counted = True  # type: ignore[attr-defined]
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
