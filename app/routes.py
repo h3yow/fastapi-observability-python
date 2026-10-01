@@ -6,13 +6,18 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 from app.context import get_request_id
 from app.observability.background import with_request_id
-from app.observability.http import DownstreamError, downstream_get
+from app.observability.http import DownstreamError, downstream_get, downstream_post
 from app.observability.logging import get_logger
+from app.observability.sensitivity import policy_for_model
 from app.schemas import LoginRequest, LoginResponse
+from app.schemas_enterprise import (
+    EnterpriseOnboardingRequest,
+    EnterpriseOnboardingResponse,
+)
 
 logger = get_logger("app.routes")
 
@@ -33,6 +38,56 @@ async def login(body: LoginRequest) -> LoginResponse:
     """
     logger.info("login request", extra={"body": body})
     return LoginResponse(status="accepted", request_id=get_request_id() or "")
+
+
+@router.post(
+    "/enterprise/onboarding",
+    response_model=EnterpriseOnboardingResponse,
+)
+async def enterprise_onboarding(
+    body: EnterpriseOnboardingRequest,
+    background_tasks: BackgroundTasks,
+) -> EnterpriseOnboardingResponse:
+    """企业实名开通：多层嵌套/数组/别名/可选分支资料。
+
+    敏感判定来自与模型同源的场景策略：
+
+    * 日志记录的是模型对象，日志层自动解析绑定策略后递归脱敏
+      （路径感知、写法归一、数组逐条），各处共用同一判定；
+    * 下游实名校验调用只在**调用记录**中写入脱敏后的请求体副本，
+      真实报文照常发送；
+    * 响应模型只含非敏感汇总字段；
+    * 校验失败由统一 422 处理器按同策略清洗（见 observability/errors.py）。
+    """
+    logger.info("enterprise onboarding request", extra={"body": body})
+    try:
+        await downstream_post(
+            "https://verification.invalid/verify",
+            json_body=body.model_dump(mode="json"),
+            # 下游调用记录按同一资料场景策略脱敏，口径与日志/响应一致。
+            policy=policy_for_model(EnterpriseOnboardingRequest),
+        )
+    except DownstreamError as exc:
+        logger.warning("verification downstream failed", extra={"reason": exc.reason})
+        raise HTTPException(status_code=502, detail="verification unavailable") from exc
+
+    background_tasks.add_task(
+        with_request_id(_write_onboarding_audit),
+        body.enterprise_name,
+    )
+    return EnterpriseOnboardingResponse(
+        status="accepted",
+        request_id=get_request_id() or "",
+        enterprise_name=body.enterprise_name,
+    )
+
+
+def _write_onboarding_audit(enterprise_name: str) -> None:
+    """开通后台审计任务：只记录非敏感企业名，request_id 快照传播。"""
+    logger.info(
+        "onboarding audit note written",
+        extra={"enterprise_name": enterprise_name, "seen_request_id": get_request_id()},
+    )
 
 
 @router.get("/users/{user_id}")

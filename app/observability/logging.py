@@ -2,7 +2,9 @@
 
 * 日志以单行 JSON 输出，自动附带当前上下文 ``request_id``；
 * 通过 :class:`RequestIdFilter` 注入关联标识，日志方法本身无需传参；
-* 所有结构化字段在写入前经 :func:`redact_value` 递归脱敏，
+* 所有结构化字段在写入前经 :func:`redact_value` 递归脱敏——该函数委托给
+  :mod:`app.observability.sensitivity` 的场景策略（与响应、下游调用记录、
+  错误统计共用同一套判定，保证口径一致），并按 ``log`` 通道累加脱敏审计；
   凭据、令牌与个人敏感字段一律替换为 ``***REDACTED***``；
 * 未处理异常记录完整异常链路（traceback），供内部排查。
 """
@@ -17,22 +19,15 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.context import get_request_id
-
-#: 脱敏后替换值（固定值，避免泄露长度等信息）。
-REDACTED = "***REDACTED***"
-
-#: 命中即脱敏的字段名（子串、大小写不敏感匹配）。
-#: 覆盖凭据/令牌：password/passwd、secret、token、api_key、authorization、credential；
-#: 覆盖个人敏感信息：id_card/idcard、phone/mobile、email、ssn。
-import re
-
-_SENSITIVE_PATTERN = re.compile(
-    r"(pass(word|wd)?|secret|token|api[_\-]?key|authorization|credential|"
-    r"id[_\-]?card|phone|mobile|email|ssn)",
-    re.IGNORECASE,
+from app.observability.sensitivity import (
+    OutputChannel,
+    REDACTED,
+    _baseline_category,
+    redact_value as _policy_redact,
 )
 
-#: 递归深度与容器规模上限，防止异常数据导致日志采集失控。
+#: 递归深度与容器规模上限的语义与 sensitivity 模块保持一致（该模块强制执行）。
+#: 以下常量仅保留供本模块文档/其他工具引用。
 _MAX_DEPTH = 6
 _MAX_ITEMS = 100
 
@@ -47,56 +42,20 @@ _RESERVED_ATTRS = frozenset(
 )
 
 
-def _is_sensitive_key(key: Any) -> bool:
-    """判断字段名是否属于敏感字段。"""
-    if not isinstance(key, str):
-        return False
-    return bool(_SENSITIVE_PATTERN.search(key))
-
-
 def redact_value(value: Any, depth: int = 0) -> Any:
-    """对任意值做递归脱敏。
+    """按统一敏感策略对任意值做递归脱敏（日志通道）。
 
-    dict 的敏感键整体替换为 :data:`REDACTED`；非敏感键递归处理。
-    list/tuple/set 的元素递归处理；Pydantic 模型按 ``model_dump`` 展开。
-    其余标量原样返回（字符串是否脱敏取决于其所属键名）。
+    实际判定在 :mod:`app.observability.sensitivity`：裸 dict 走基线凭据/个人
+    信息规则；Pydantic 模型自动解析其绑定的场景策略（路径感知、别名归一、
+    数组逐条）。``depth`` 参数仅为兼容历史调用签名，递归深度由策略模块统一
+    强制（>=6 一律掩码）。
 
     >>> redact_value({"password": "p@ss", "user": {"token": "t", "id": 1}})
     {'password': '***REDACTED***', 'user': {'token': '***REDACTED***', 'id': 1}}
     >>> redact_value([{"api_key": "k"}, "ok"])
     [{'api_key': '***REDACTED***'}, 'ok']
     """
-    if depth >= _MAX_DEPTH:
-        return REDACTED
-
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for i, (key, item) in enumerate(value.items()):
-            if i >= _MAX_ITEMS:
-                result["...truncated"] = True
-                break
-            if _is_sensitive_key(key):
-                result[str(key)] = REDACTED
-            else:
-                result[str(key)] = redact_value(item, depth + 1)
-        return result
-
-    if hasattr(value, "model_dump") and callable(value.model_dump):
-        try:
-            return redact_value(value.model_dump(), depth + 1)
-        except Exception:
-            return "<unserializable>"
-
-    if isinstance(value, list | tuple | set | frozenset):
-        seq = list(value)[:_MAX_ITEMS]
-        redacted = [redact_value(item, depth + 1) for item in seq]
-        if isinstance(value, tuple):
-            return tuple(redacted)
-        if isinstance(value, set | frozenset):
-            return set(redacted)
-        return redacted
-
-    return value
+    return _policy_redact(value, channel=OutputChannel.LOG)
 
 
 def sanitize_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -104,7 +63,7 @@ def sanitize_headers(headers: Mapping[str, str]) -> dict[str, str]:
     credential_headers = {"authorization", "cookie", "proxy-authorization", "x-api-key"}
     result: dict[str, str] = {}
     for key, value in headers.items():
-        if key.lower() in credential_headers or _is_sensitive_key(key):
+        if key.lower() in credential_headers or _baseline_category(key) is not None:
             result[key] = REDACTED
         else:
             result[key] = value

@@ -36,6 +36,12 @@ _counters: dict[tuple[str, str, int, str, str], int] = {}
 # (method, route, outcome, error_code) -> {"buckets": [c...], "sum": float, "count": int}
 _histograms: dict[tuple[str, str, str, str], dict[str, object]] = {}
 
+#: 脱敏审计计数：(字段类别, 输出通道, 错误类别) -> 掩码次数。
+#: 三个标签全部取自封闭枚举/有限错误码集合，且不含字段名、路径或取值，
+#: 因此维度数有硬上界（类别数 × 通道数 × 错误码数），不会随资料字段增长。
+_MASK_COUNTER_NAME = "masked_inputs_total"
+_mask_counters: dict[tuple[str, str, str], int] = {}
+
 
 def _normalize_method(method: str | None) -> str:
     upper = (method or "").upper()
@@ -87,6 +93,34 @@ def observe_request(
         hist["count"] = int(hist["count"]) + 1  # type: ignore[arg-type]
 
 
+def observe_mask(
+    field_category: str,
+    output_channel: str,
+    error_code: str = "",
+    *,
+    count: int = 1,
+) -> None:
+    """记录敏感输入被掩码的次数（脱敏审计）。
+
+    :param field_category: 字段类别（必须来自封闭枚举，如 ``contact``）。
+    :param output_channel: 输出通道（封闭枚举：log/response/downstream）。
+    :param error_code: 关联的对外错误码；非错误路径传空串。维度仍为
+        有限错误码枚举，调用方不得传入任意字符串。
+    :param count: 本次累加次数（数组逐条掩码时一次提交，临界区更短）。
+
+    临界区仅一次 dict 自增，无 I/O；标签不含原始值或字段路径。
+    """
+    key = (field_category, output_channel, error_code)
+    with _lock:
+        _mask_counters[key] = _mask_counters.get(key, 0) + count
+
+
+def get_mask_counts() -> dict[tuple[str, str, str], int]:
+    """返回脱敏审计计数快照（测试断言用；只暴露低基数维度与计数）。"""
+    with _lock:
+        return dict(_mask_counters)
+
+
 def _escape_label(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
@@ -100,6 +134,7 @@ def render_prometheus() -> str:
     with _lock:
         counter_items = sorted(_counters.items())
         hist_items = sorted(_histograms.items())
+        mask_items = sorted(_mask_counters.items())
 
     lines: list[str] = []
     lines.append(f"# HELP {_COUNTER_NAME} Total HTTP requests by method/route/status/outcome/error_code.")
@@ -126,6 +161,19 @@ def render_prometheus() -> str:
         labels = _labels(**base_labels)
         lines.append(f'{_HIST_NAME}_sum{labels} {hist["sum"]:.6f}')
         lines.append(f'{_HIST_NAME}_count{labels} {hist["count"]}')
+
+    lines.append(
+        f"# HELP {_MASK_COUNTER_NAME} Total masked sensitive inputs by "
+        f"field_category/output_channel/error_code (no values, no field paths)."
+    )
+    lines.append(f"# TYPE {_MASK_COUNTER_NAME} counter")
+    for (field_category, output_channel, error_code), value in mask_items:
+        labels = _labels(
+            field_category=field_category,
+            output_channel=output_channel,
+            error_code=error_code,
+        )
+        lines.append(f"{_MASK_COUNTER_NAME}{labels} {value}")
     return "\n".join(lines) + "\n"
 
 
@@ -134,3 +182,4 @@ def reset_metrics() -> None:
     with _lock:
         _counters.clear()
         _histograms.clear()
+        _mask_counters.clear()

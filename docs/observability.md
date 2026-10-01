@@ -1,12 +1,17 @@
 # 本地可观测性能力说明
 
 本服务在 FastAPI 上内置了一套无需外部组件即可本地验证的可观测性能力：
-**关联标识（request_id）贯穿、按路由模板聚合的指标、日志/错误响应脱敏与异常映射**。
-三者共享同一入口中间件与错误码口径，保证“日志、指标、对外错误响应”一致且可解释。
+**关联标识（request_id）贯穿、按路由模板聚合的指标、日志/错误响应脱敏与异常映射、
+场景化敏感字段策略与脱敏审计**。
+它们共享同一入口中间件、错误码口径与同一套敏感判定，保证“日志、指标、
+对外错误响应、下游调用记录”一致且可解释。
 
 - 应用入口：`app/main.py`（根目录 `main.py` 保留兼容，`uvicorn main:app` 可用）
-- 核心代码：`app/context.py`、`app/observability/`
-- 测试：`tests/`（18 个用例，覆盖并发隔离、脱敏、异常映射、指标口径）
+- 核心代码：`app/context.py`、`app/observability/`（含 `sensitivity.py`
+  场景策略/脱敏/审计、`codes.py` 稳定错误码）
+- 企业实名开通场景：`app/schemas_enterprise.py`、路由 `POST /enterprise/onboarding`
+- 测试：`tests/`（33 个用例，覆盖并发隔离、脱敏、异常映射、指标口径、
+  企业开通场景与脱敏审计）
 
 ---
 
@@ -113,36 +118,140 @@
 - 采集动作是一次计时 + 一次加锁自增，不发起网络/磁盘操作，
   不会明显拖慢请求；直方图桶为定长 12 个。
 
+### 2.5 脱敏审计计数器
+
+除 HTTP 指标外，`/metrics` 还暴露脱敏审计计数器 `masked_inputs_total`
+（Counter），用于统计敏感输入被掩码的次数。其标签口径与基数约束详见
+**第 3.5 节**；这里仅说明与 HTTP 指标的关系：
+
+- 两者共用同一个全局锁与渲染端点，渲染均按字典序排序、输出确定；
+- 脱敏审计**不使用** `route`、真实路径、字段名或任何输入值，
+  因此它的基数甚至低于 HTTP 指标（路由数量不影响审计维度）。
+
 ---
 
-## 3. 脱敏范围
+## 3. 脱敏：场景策略、匹配范围与写法识别
 
-脱敏逻辑在 `app/observability/logging.py`，对日志与对外信息分别处理。
+脱敏判定与递归遍历统一收敛在 `app/observability/sensitivity.py`，
+日志（`logging.py`）、422 错误明细（`errors.py`）、下游调用记录（`http.py`）
+都委托给它，**不各自维护一份敏感字段清单**。
 
-### 3.1 敏感字段（键名子串、大小写不敏感匹配）
+### 3.1 两层判定模型
 
-命中以下任一模式的**字段名**，其整个值被替换为固定掩码 `***REDACTED***`
-（不保留长度信息）：
+| 层 | 作用 | 适用范围 |
+|---|---|---|
+| **基线规则** | 凭据/令牌与个人信息键名的大小写不敏感正则 | 未声明场景的载荷（如 `/login`），以及任何场景中“路径 trie 之外”的键 |
+| **场景策略** | 与 Pydantic 模型同源、按**完整路径**声明的敏感字段 | 企业实名开通等结构化资料（`enterprise_onboarding`） |
+
+命中任一层即按对应**字段类别**整体掩码为固定值 `***REDACTED***`
+（不保留长度信息）。基线正则覆盖：
 
 - 凭据/令牌：`password`/`passwd`、`secret`、`token`、`api_key`（含 `apikey`）、
   `authorization`、`credential`
-- 个人敏感信息：`id_card`（身份证）、`phone`/`mobile`、`email`、`ssn`
+- 个人敏感信息：`id_card`（身份证）、`ssn`、`phone`/`mobile`、`email`
 
-处理范围：
+字段类别是封闭枚举，只有四种：`credential` / `id_document` / `contact` /
+`financial`，同时用作脱敏审计标签（见 3.5）。
 
-- dict / list / tuple / set **递归脱敏**（深度上限 6、每层 100 项，防止异常数据
-  拖垮采集）；Pydantic 模型经 `model_dump()` 展开后同样脱敏；
+### 3.2 场景敏感字段如何声明（与资料同源，新增版本免改公共配置）
+
+企业开通场景在 `app/schemas_enterprise.py` 内完成“资料 + 敏感范围”声明，
+二者同文件、同版本：
+
+```python
+policy = register_policy("enterprise_onboarding")
+
+# 按规范字段路径声明敏感类别；同一字段名可在不同路径有不同级别
+policy.mark(("legal_representative", "name"), FieldCategory.ID_DOCUMENT)
+policy.mark(("legal_representative", "certificate"), FieldCategory.ID_DOCUMENT)
+policy.mark(("contacts", "phone"), FieldCategory.CONTACT)
+policy.mark(("bank_account", "account_number"), FieldCategory.FINANCIAL)
+policy.mark(("attachments", "download_url"), FieldCategory.CREDENTIAL)
+# contacts[].name 故意不声明 -> 非敏感（与法人姓名同名但不同级）
+
+bind_model_policy(EnterpriseOnboardingRequest, policy)  # 内省字段元数据
+```
+
+`bind_model_policy` 会自动从 Pydantic 元数据内省：
+
+- **嵌套对象层级**：字段注解里的 `Model`、`Model | None`（可选分支）、
+  `list[Model]`（对象数组）都会递归展开成一棵路径 trie；
+- **数组逐条**：`contacts` / `attachments` 是数组时，**每一条**元素都按同一
+  子结构判定，不因在数组里而漏判；标量数组与对象数组都支持；
+- **可选分支**：`bank_account`、`certificate` 等缺省为 `None` 时，缺失值
+  保持 `None`，**不**替换为掩码、也**不**计入脱敏审计（没有真实输入被掩码）。
+
+新增资料字段/新版本资料时，只需：扩展模型字段 + 补一条 `policy.mark(...)`，
+无需修改 `logging.py` 等任何公共配置；未显式 mark 的新字段默认非敏感
+（安全默认是“可观测”，敏感必须显式声明，评审时一眼可见）。
+
+### 3.3 写法归一：大小写、下划线、连字符按同一规则识别
+
+解析侧与脱敏侧共用同一个折叠函数：
+
+```
+normalize_key(s) = s.lower().replace("_", "").replace("-", "")
+```
+
+因此 `certNumber` / `cert_number` / `cert-number` / `CERT_NUMBER` 都折叠为
+`certnumber`，按同一字段识别。为让**解析层**（Pydantic 绑定）也接受这些写法，
+顶层模型挂了一个 `model_validator(mode="before")`，进入校验前按字段元数据
+递归归一键名（数组逐条、可选分支按结构匹配），错误明细中的字段路径因此以
+**规范字段名**给出，前端按规范路径定位即可，不受客户端具体写法影响。
+
+- 折叠只解决“大小写 + 分隔符”差异；对于折叠后仍不同形的同义词
+  （如 `mobile` 与 `phone`），在字段的
+  `json_schema_extra={"input_synonyms": [...]}` 中显式声明，随字段同源；
+- `AliasChoices` / `validation_alias` / `serialization_alias` 中的写法同样
+  被内省为可接受写法。
+
+### 3.4 匹配范围与判定一致性
+
+- 递归深度上限 6、每层最多 100 项（超出截断标记，防止异常数据拖垮采集）；
+  Pydantic 模型经 `model_dump(mode="json")` 展开后判定；
+- **同一份请求在各处的判定必须一致**：路由日志记录的是模型对象，日志层自动
+  解析其绑定策略；下游调用记录显式传入同一策略；422 明细按“路由声明的 body
+  模型”反查策略。因此一个手机号要么在日志、响应、下游记录里全部被掩码，
+  要么全部保留，不会出现一处掩码一处明文；
 - HTTP 请求头中 `Authorization`、`Cookie`、`Proxy-Authorization`、`X-Api-Key`
-  整体掩码（记录错误上下文时使用）；
-- 校验错误（422）详情经同一脱敏函数处理，避免 pydantic 回显的原始输入泄露。
+  整体掩码；
+- 真实发给下游的业务报文**不脱敏**（下游需要原始资料），脱敏只发生在
+  “下游调用的日志记录副本”上；测试同时断言“记录无原始值”与“真实报文含原始值”。
 
-### 3.2 日志与响应的边界
+### 3.5 脱敏审计计数（低基数，不记值、不记路径）
+
+新增 Prometheus 计数器 `masked_inputs_total`，在 `GET /metrics` 暴露：
+
+```
+masked_inputs_total{field_category="contact",output_channel="log",error_code=""} 3
+```
+
+| 标签 | 取值 | 基数约束 |
+|---|---|---|
+| `field_category` | `credential`/`id_document`/`contact`/`financial` | 固定 4 |
+| `output_channel` | `log`/`response`/`downstream` | 固定 3 |
+| `error_code` | 成功为空串；校验失败为 `VALIDATION_FAILED`（其余稳定错误码同理） | 有限错误码枚举 |
+
+口径与约束：
+
+- 计数含义是“敏感输入**被掩码的次数**”：同一份敏感体出现在多个输出事件
+  （如请求日志 + 下游调用记录）会分别计数，因为它们是独立的掩码动作；
+  同一事件内已掩码的载荷经 `PreRedacted` 包装透传，**不会二次计数**；
+- **绝不记录原始值、字段名或字段路径**，因此无法从指标反推任何个人信息；
+- 维度组合数有硬上界 `4 × 3 × 错误码数`，字段和别名组合增多、请求条数增多
+  都不会让维度增长（测试以 40 个含不同值/别名的请求验证标签数不超过上界）；
+- 判定是锁外的纯内存 trie 遍历（每字段 O(路径深度)），仅在按类别聚合计数后
+  一次进入全局锁，临界区为常数次自增；测试验证 19 个联系人的请求单次脱敏
+  仍在毫秒级，16 线程 × 50 次并发计数精确无丢失。
+
+### 3.6 日志与响应的边界
 
 - **日志**：单行 JSON 到 stderr，固定字段 `ts/level/logger/message/request_id`，
   所有 `extra` 字段递归脱敏；未处理异常记录 `exception_type` 与**完整 traceback**
   （`exc_info`），供内部排查——原始异常链路只进日志。
-- **对外响应**：成功响应的模型本身不回传敏感字段（如登录只返回 status/request_id）；
-  错误响应只包含稳定的 `code/message/request_id`（422 另附字段级定位 details），
+- **对外响应**：成功响应的模型本身不回传敏感字段（开通响应只含
+  status/request_id/非敏感企业名）；错误响应只包含稳定的
+  `code/message/request_id`（422 另附字段级 details，见第 4.1 节），
   **绝不包含原始异常消息、堆栈或下游返回体**。
 
 ---
@@ -172,6 +281,32 @@
 
 错误码稳定、互相可区分；同一种失败永远得到同一个 code，不受底层异常文案影响。
 
+### 4.1 参数校验失败（422）明细的安全展示与兼容边界
+
+422 响应体在统一错误包装外附 `error.details`（Pydantic v2 错误列表）。
+处理器（`app/observability/errors.py`）调用 `scrub_validation_errors()`，
+按当前路由资料模型的同一份场景策略逐条清洗：
+
+| 字段是否敏感 | 保留内容 | 去除/替换内容 |
+|---|---|---|
+| **敏感字段**（路径命中策略/基线） | `loc`（字段定位，含数组下标）、`type`（失败规则）、`url`，并加 `"redacted": true` | 删除 `input` 与 `ctx`；`msg` 统一替换为不含输入的安全说明 `Sensitive field failed validation; input value withheld.` |
+| **非敏感字段** | 完整保留 `loc`/`type`/`msg`/`url`/`input`/`ctx`，前端可据此定位并回显用户输入 | 仅当 `input`/`ctx` 内部嵌套了敏感值时才掩码；`msg` 若回显了任何敏感标量也会被清扫 |
+
+要点：
+
+- **可定位**：无论字段多深、是否在数组或可选分支下，`loc` 始终给出
+  `body → 规范字段名（→ 数组下标）` 的完整路径；字段路径以**规范名**给出
+  （before 归一器先把 camel/snake/kebab 写法统一），对前端稳定；
+- **可解释**：`type`（如 `string_too_short`/`missing`）与 `url` 保留，
+  前端能知道失败的是哪条规则；敏感字段额外用固定安全文案，不泄露长度/取值；
+- **零泄露**：清洗后的同一份 `details` 同时用于响应与内部日志，敏感输入不会
+  出现在响应体、日志或错误统计中；并按 `response` 与 `log` 两个通道分别计入
+  脱敏审计（错误类别固定为 `VALIDATION_FAILED`）；
+- **兼容边界**：details 仍是 Pydantic v2 错误对象的子集（字段名 `type/loc/msg/
+  url/input/ctx` 未变），既有按这些键消费的前端不受影响；新增的仅为
+  `redacted: true` 布尔标记（额外字段，向后兼容）；稳定错误码与
+  `VALIDATION_FAILED` 不变。
+
 ---
 
 ## 5. 示例接口
@@ -179,12 +314,13 @@
 | 方法 & 路径 | 用途 |
 |---|---|
 | `GET /` | 正常同步响应，响应体含当前 request_id |
-| `POST /login` | 含 password/id_card，验证日志与响应脱敏 |
+| `POST /login` | 含 password/id_card，验证日志与响应脱敏（基线规则） |
+| `POST /enterprise/onboarding` | **企业实名开通**：嵌套/数组/别名/可选分支资料，验证场景策略、422 明细与脱敏审计 |
 | `GET /users/{user_id}` | 路径参数，验证指标按模板聚合 |
 | `GET /bg?note=` | 调度线程池后台任务，验证 request_id 快照传播 |
-| `GET /downstream?url=` | 下游调用，验证 `X-Request-ID` 透传（测试用 MockTransport） |
+| `GET /downstream?url=` | 下游 GET，验证 `X-Request-ID` 透传（测试用 MockTransport） |
 | `GET /boom?kind=http\|other` | 显式 HTTPException(409) 或未处理异常(500) |
-| `GET /metrics` | Prometheus 文本指标 |
+| `GET /metrics` | Prometheus 文本指标（含 `masked_inputs_total` 脱敏审计） |
 
 ---
 
@@ -216,6 +352,37 @@ curl -s -X POST http://127.0.0.1:8000/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"bob","password":"supersecret","id_card":"110101199001011234"}'
 
+# 3b) 企业实名开通：刻意混用 camel/snake/kebab/大写写法；
+#     响应只回非敏感企业名；服务端日志里法人姓名/证件号/手机号/邮箱/账号/
+#     附件签名 URL 全部显示为 ***REDACTED***，联系人姓名/文件名/开户名保留；
+#     真实下游报文（测试环境为 MockTransport）仍携带原始资料。
+curl -s -X POST http://127.0.0.1:8000/enterprise/onboarding \
+  -H 'Content-Type: application/json' -H 'X-Request-ID: ent-demo-0001' \
+  -d '{
+    "EnterpriseName": "ACME有限公司",
+    "credit-code": "91110000XXXXXXXXX1",
+    "legalRepresentative": {
+      "name": "张三",
+      "idNumber": "110101199001011234",
+      "certificate": {"certNumber": "CERT-99998877","issued_date": "2020-01-01"}
+    },
+    "contacts": [
+      {"name": "李四", "mobilePhone": "13800138000", "EMAIL": "li@example.com"},
+      {"name": "王五", "mobile": "13900139000"}
+    ],
+    "bank_account": {"accountName": "ACME有限公司", "account_number": "6222021234567890123"},
+    "attachments": [{"FileName": "license.jpg", "download-url": "https://o/f?token=SIGSECRET99"}]
+  }'
+
+# 3c) 开通校验失败：非敏感字段（enterprise_name/credit_code）保留 input；
+#     敏感字段只给 loc/type 与固定安全文案（redacted=true），无 input/ctx。
+curl -s -X POST http://127.0.0.1:8000/enterprise/onboarding \
+  -H 'Content-Type: application/json' -H 'X-Request-ID: ent-demo-422' \
+  -d '{"enterprise_name":"A","credit_code":"short",
+       "legal_representative":{"name":"张三","idNumber":"123"},
+       "contacts":[{"name":"李四","phone":"138"}],
+       "bank_account":{"account_name":"ACME","account_number":"12"}}'
+
 # 4) 校验失败 / 未匹配路由 / 内部异常的稳定错误码
 curl -s -X POST http://127.0.0.1:8000/login -H 'Content-Type: application/json' -d '{"username":"bob"}'
 curl -s http://127.0.0.1:8000/no/such/path/12345
@@ -224,11 +391,26 @@ curl -s http://127.0.0.1:8000/boom?kind=other
 # 5) 后台任务：响应后服务端日志仍打印同一 request_id
 curl -s -H 'X-Request-ID: bg-demo-0001' 'http://127.0.0.1:8000/bg?note=hi'
 
-# 6) 指标：注意 /users/1 与 /users/2 只有一个 route="/users/{user_id}" 维度
+# 6) 指标：注意 /users/1 与 /users/2 只有一个 route="/users/{user_id}" 维度；
+#    masked_inputs_total 只按 字段类别×通道×错误类别 聚合，没有字段名/路径/值。
 curl -s http://127.0.0.1:8000/users/1 >/dev/null
 curl -s http://127.0.0.1:8000/users/2 >/dev/null
-curl -s http://127.0.0.1:8000/metrics
+curl -s http://127.0.0.1:8000/metrics | grep masked_inputs_total
 ```
+
+期望结果（要点）：
+
+- 3b 的 HTTP 响应：`{"status":"accepted","request_id":"ent-demo-0001",
+  "enterprise_name":"ACME有限公司"}`，不含任何证件号/手机号/账号；
+  服务端 JSON 日志中所有敏感字段值均为 `***REDACTED***`，联系人姓名
+  （`李四`/`王五`）、文件名、开户名、企业名等非敏感值保留；
+- 3c 的 422 响应：`error.code` 恒为 `VALIDATION_FAILED`；`enterprise_name`、
+  `credit_code` 的错误带原始 `input`（`"A"`/`"short"`），而 `idNumber`、
+  `contacts[0].phone`、`account_number` 的错误只有 `loc/type/redacted`，
+  响应与日志里都搜不到 `123`、`138` 等敏感输入；
+- `/metrics` 中 `masked_inputs_total` 形如
+  `masked_inputs_total{field_category="contact",output_channel="log",error_code=""} N`，
+  标签值只能是 4 个类别、3 个通道与有限错误码。
 
 ### 6.3 自动化测试
 
@@ -239,11 +421,23 @@ curl -s http://127.0.0.1:8000/metrics
 - `-s` 会打印每个用例的**输入、关联标识与判定依据**（`[用例] ...` 行）；
 - 断言失败消息均带可区分原因（期望/实际值与场景说明）。
 
-测试分布：
+测试分布（共 33 个用例）：
 
 - `tests/test_concurrency.py`：50 并发标识隔离、并发生成唯一性、
   沿用/替换 9 个边界、并发日志关联、后台任务、下游透传、异常响应关联；
 - `tests/test_sanitization.py`：嵌套脱敏、请求头脱敏、登录日志/响应无泄露、
   未处理异常“对外 500 + 对内完整堆栈”、错误码稳定可区分、422 详情、下游 502；
 - `tests/test_metrics.py`：四类结果同口径、高基数路径维度聚合、
-  直方图与计数一致、16 线程 × 200 请求并发计数正确。
+  直方图与计数一致、16 线程 × 200 请求并发计数正确；
+- `tests/test_enterprise_onboarding.py`（9 个）：开通成功路径四处观测面
+  （响应/日志/下游记录/错误统计）无探针泄露、同名字段按路径分级、
+  camel/snake/kebab/大写与同义词归一、数组逐条、可选分支缺省不误掩码、
+  422 敏感/非敏感明细差异化展示、缺失敏感字段可定位、脱敏审计低基数、
+  30 并发请求计数不丢不串（唯一探针跨 request_id 检测）；
+- `tests/test_mask_audit.py`（6 个）：三通道同输入判定逐字节一致、
+  不同写法判定一致、基线规则兜底、40 请求标签组合不超封闭上界（维度爆炸）、
+  19 联系人请求脱敏毫秒级（性能回退）、16×50 纯并发计数精确。
+
+新用例的失败断言带三类可区分前缀：`[泄露]`（原始值出现在观测面）、
+`[口径不一致]`（不同通道/写法/路径的判定或计数对不上）、
+`[并发串扰]`（并发行之间互相污染或丢计数）。

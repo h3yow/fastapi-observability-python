@@ -19,6 +19,12 @@ import httpx
 
 from app.context import REQUEST_ID_HEADER, get_request_id, new_request_id
 from app.observability.logging import get_logger, sanitize_headers
+from app.observability.sensitivity import (
+    OutputChannel,
+    PreRedacted,
+    SensitivityPolicy,
+    redact_value as policy_redact_value,
+)
 
 logger = get_logger("app.http")
 
@@ -84,6 +90,73 @@ async def downstream_get(
         "downstream call done",
         extra={
             "url": url,
+            "status_code": response.status_code,
+            "duration_ms": round(duration * 1000, 3),
+            "response_headers": sanitize_headers(dict(response.headers)),
+        },
+    )
+    if response.status_code >= 400:
+        raise DownstreamError(url, reason="non_2xx_status", status_code=response.status_code)
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise DownstreamError(url, reason="invalid_json") from exc
+
+
+async def downstream_post(
+    url: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+    client: httpx.AsyncClient | None = None,
+    policy: SensitivityPolicy | None = None,
+) -> dict[str, Any]:
+    """携带当前 request_id 发起下游 POST，返回 JSON dict。
+
+    请求体本身原样发给可信下游（业务需要），但**写入日志的请求体副本**经
+    场景策略统一脱敏并按 ``downstream`` 通道计入脱敏审计；判定与日志、响应、
+    错误统计完全一致，且只在调用记录中体现掩码值，不影响真实报文。
+
+    :raises DownstreamError: 传输异常或下游返回非 2xx。
+    """
+    request_id = get_request_id() or new_request_id()
+    headers = {REQUEST_ID_HEADER: request_id}
+    active = client or get_client()
+    start = time.perf_counter()
+    logged_body = (
+        PreRedacted(
+            policy_redact_value(
+                json_body, policy=policy, channel=OutputChannel.DOWNSTREAM
+            )
+        )
+        if json_body is not None
+        else None
+    )
+    logger.info(
+        "downstream call start",
+        extra={
+            "url": url,
+            "method": "POST",
+            "json_body": logged_body,
+            "headers": sanitize_headers(headers),
+        },
+    )
+    try:
+        response = await active.post(url, json=json_body, headers=headers)
+    except httpx.HTTPError as exc:
+        duration = time.perf_counter() - start
+        logger.error(
+            "downstream transport error",
+            extra={"url": url, "method": "POST", "duration_ms": round(duration * 1000, 3)},
+            exc_info=exc,
+        )
+        raise DownstreamError(url, reason=type(exc).__name__) from exc
+
+    duration = time.perf_counter() - start
+    logger.info(
+        "downstream call done",
+        extra={
+            "url": url,
+            "method": "POST",
             "status_code": response.status_code,
             "duration_ms": round(duration * 1000, 3),
             "response_headers": sanitize_headers(dict(response.headers)),

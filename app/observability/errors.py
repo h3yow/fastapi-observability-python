@@ -24,23 +24,43 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.context import REQUEST_ID_HEADER, get_request_id, set_request_id
+from app.observability.codes import (
+    CODE_CONFLICT,
+    CODE_DOWNSTREAM,
+    CODE_FORBIDDEN,
+    CODE_HTTP,
+    CODE_INTERNAL,
+    CODE_METHOD_NOT_ALLOWED,
+    CODE_NOT_FOUND,
+    CODE_ROUTE_NOT_FOUND,
+    CODE_SERVICE_UNAVAILABLE,
+    CODE_TOO_MANY_REQUESTS,
+    CODE_UNAUTHORIZED,
+    CODE_VALIDATION,
+)
+
+__all__ = [
+    "CODE_CONFLICT",
+    "CODE_DOWNSTREAM",
+    "CODE_FORBIDDEN",
+    "CODE_HTTP",
+    "CODE_INTERNAL",
+    "CODE_METHOD_NOT_ALLOWED",
+    "CODE_NOT_FOUND",
+    "CODE_ROUTE_NOT_FOUND",
+    "CODE_SERVICE_UNAVAILABLE",
+    "CODE_TOO_MANY_REQUESTS",
+    "CODE_UNAUTHORIZED",
+    "CODE_VALIDATION",
+]
 from app.observability.logging import get_logger, redact_value, sanitize_headers
+from app.observability.sensitivity import (
+    OutputChannel,
+    policy_for_request,
+    scrub_validation_errors,
+)
 
 logger = get_logger("app.errors")
-
-#: 稳定、可区分的错误码集合（指标与文档以此为准）。
-CODE_INTERNAL = "INTERNAL_ERROR"
-CODE_VALIDATION = "VALIDATION_FAILED"
-CODE_ROUTE_NOT_FOUND = "ROUTE_NOT_FOUND"
-CODE_METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"
-CODE_UNAUTHORIZED = "UNAUTHORIZED"
-CODE_FORBIDDEN = "FORBIDDEN"
-CODE_NOT_FOUND = "NOT_FOUND"
-CODE_TOO_MANY_REQUESTS = "TOO_MANY_REQUESTS"
-CODE_SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
-CODE_DOWNSTREAM = "DOWNSTREAM_ERROR"
-CODE_CONFLICT = "CONFLICT"
-CODE_HTTP = "HTTP_ERROR"
 
 _HTTP_STATUS_TO_CODE = {
     401: CODE_UNAUTHORIZED,
@@ -95,13 +115,22 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        # 仅回传字段位置与类型/规则信息；校验消息中的输入值由 pydantic 提供，
-        # 这里统一走脱敏，避免原始输入（可能含敏感值）出现在响应与日志中。
-        errors = redact_value(exc.errors())
+        # 按当前路由声明的资料模型解析场景策略；未声明资料模型的路由（如
+        # /login）退化为凭据/个人信息基线规则。同一份清洗结果同时用于响应与
+        # 日志，保证“响应/日志/错误统计”判定一致、且只计一次审计计数。
+        policy = policy_for_request(request)
+        cleaned_errors = scrub_validation_errors(
+            list(exc.errors()),
+            body=getattr(exc, "body", None),
+            policy=policy,
+            channels=(OutputChannel.RESPONSE, OutputChannel.LOG),
+        )
         request_id = _effective_request_id(request)
         logger.warning(
             "request validation failed",
-            extra={"request_ctx": _safe_request_context(request), "validation_errors": errors},
+            # 已清洗明细直接记录：敏感输入已被剥离/掩码，不再过通用脱敏，
+            # 否则同一次掩码会在 response 与 log 两个通道被重复计数。
+            extra={"request_ctx": _safe_request_context(request), "validation_errors": cleaned_errors},
         )
         request.state.error_code = CODE_VALIDATION
         body = _error_body(
@@ -109,7 +138,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             "Request parameters failed validation.",
             request_id,
         )
-        body["error"]["details"] = errors
+        body["error"]["details"] = cleaned_errors
         return _json_error(request, 422, body)
 
     @app.exception_handler(StarletteHTTPException)
