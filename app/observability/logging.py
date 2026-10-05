@@ -6,6 +6,9 @@
   :mod:`app.observability.sensitivity` 的场景策略（与响应、下游调用记录、
   错误统计共用同一套判定，保证口径一致），并按 ``log`` 通道累加脱敏审计；
   凭据、令牌与个人敏感字段一律替换为 ``***REDACTED***``；
+* **每条 LogRecord 只脱敏一次**：extra 脱敏结果缓存在记录上，服务上多挂
+  一路日志输出（多个 handler/formatter）或同一条记录被渲染多次都复用同一
+  快照，``log`` 通道审计计数因此与输出路数/渲染次数无关；
 * 未处理异常记录完整异常链路（traceback），供内部排查。
 """
 
@@ -78,8 +81,46 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
+#: LogRecord 上缓存“本条记录 extra 脱敏快照”的属性名。
+#: 脱敏审计计数只与实际发生的掩码有关：一条日志被多少路 handler 输出、
+#: 被 JsonFormatter 渲染多少次，都只做一次递归脱敏、一次计数；后续渲染
+#: 直接复用同一快照（快照中已是掩码值，本身也不再含可掩码的原始输入）。
+_REDACTED_EXTRAS_ATTR = "_observability_redacted_extras"
+
+#: JsonFormatter 固定输出的基础载荷键（extra 收集时排除，避免重复/覆盖）。
+_PAYLOAD_BASE_KEYS = frozenset(
+    {"ts", "level", "logger", "message", "request_id"}
+)
+
+
+def _redacted_extras(record: logging.LogRecord) -> dict[str, Any]:
+    """返回（必要时首次构建并缓存）本条记录 extra 字段的脱敏快照。
+
+    缓存放于 :class:`logging.LogRecord` 自身而非某个 formatter 实例，
+    因此即使在服务上为 ``app`` logger 多挂一路输出（第二个 handler +
+    第二个 formatter 实例），同一条记录的脱敏动作与 ``log`` 通道审计
+    计数也恰好发生一次，与输出路数、渲染次数无关。
+    """
+    cached = getattr(record, _REDACTED_EXTRAS_ATTR, None)
+    if cached is not None:
+        return cached
+    snapshot: dict[str, Any] = {}
+    for key, value in record.__dict__.items():
+        if key in _RESERVED_ATTRS or key in _PAYLOAD_BASE_KEYS or key == _REDACTED_EXTRAS_ATTR:
+            continue
+        snapshot[key] = redact_value(value)
+    # LogRecord 支持任意属性挂载；同一记录在单线程 logging 调用内被各
+    # handler 顺序渲染，发布后不再复用，缓存无需加锁。
+    setattr(record, _REDACTED_EXTRAS_ATTR, snapshot)
+    return snapshot
+
+
 class JsonFormatter(logging.Formatter):
-    """将日志记录渲染为单行 JSON，extra 字段递归脱敏。"""
+    """将日志记录渲染为单行 JSON，extra 字段递归脱敏。
+
+    脱敏对每条 :class:`logging.LogRecord` 只执行一次（结果缓存在记录上），
+    多个 handler/多次渲染复用同一份快照，审计计数不受输出路数影响。
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -91,10 +132,7 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "request_id": getattr(record, "request_id", None),
         }
-        for key, value in record.__dict__.items():
-            if key in _RESERVED_ATTRS or key in payload:
-                continue
-            payload[key] = redact_value(value)
+        payload.update(_redacted_extras(record))
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)

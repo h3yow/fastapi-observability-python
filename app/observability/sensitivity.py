@@ -9,16 +9,24 @@
 * **路径感知**：同一字段名在不同子结构中可以有不同敏感级别
   （如 ``legal_representative.name`` 敏感，``contacts[].name`` 非敏感），
   判定依据是完整路径而不是裸键名；数组逐元素遍历，不漏任何一条；
+* **结构错配也安全**：trie 为每个节点汇总子树敏感类别，客户端在本该是
+  数组/对象的位置（顶层、嵌套、数组元素、可选分支，乃至整个 body）直接
+  填一个敏感单值而导致校验失败时，错误明细、日志、错误统计都不带原始值；
 * **写法归一**：大小写、下划线、连字符通过 :func:`normalize_key` 统一折叠；
 * **基线兜底**：未声明场景（如 /login）继续沿用凭据/个人信息基线规则；
 * **判定一致**：日志、响应、下游调用记录共用本模块同一套判定；
+  422 明细清洗一次，响应与日志复用同一份结果；
 * **脱敏审计**：每次掩码仅按封闭低基数维度
-  （字段类别 × 输出通道 × 错误类别）累加计数，绝不记录原始值或字段路径。
+  （字段类别 × 输出通道 × 错误类别）累加计数，绝不记录原始值或字段路径；
+  计数只与实际掩码有关——日志侧对同一条记录只脱敏一次（快照缓存在
+  LogRecord 上），多挂输出 handler、formatter 多次渲染均不重复计数
+  （见 :mod:`app.observability.logging`）。
 """
 
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Mapping, Sequence as AbcSequence
 from enum import Enum
 from typing import Any, get_args, get_origin
@@ -30,6 +38,9 @@ from app.observability.metrics import observe_mask
 
 #: 脱敏替换值（固定值，不保留长度信息）。
 REDACTED = "***REDACTED***"
+
+#: “调用方未提供该参数”的内部哨兵（None 本身是合法输入，不能当缺省值）。
+_UNSET: Any = object()
 
 #: 递归深度与每层元素上限（与日志采集上限一致，防止异常数据拖垮处理）。
 _MAX_DEPTH = 6
@@ -121,13 +132,21 @@ class _Node:
 
     同一子结构通过多条边到达同一子节点（字段名 + 各种别名归一后均指向它）；
     ``array_edges`` 标记某条边是“对象数组”，数组每个元素都按该子结构遍历。
+
+    ``category`` 是该节点自身（叶子）的敏感类别；``subtree_category`` 是
+    “该节点自身或其任意后代被声明为敏感”时的代表类别，用于客户端把
+    数组/对象位置错填成单值等形状错误——此时无法继续下钻，但该位置本应
+    承载的结构里含敏感字段，原始值必须按敏感处理，不能回显。
     """
 
-    __slots__ = ("children", "category")
+    __slots__ = ("children", "category", "subtree_category", "is_array_node")
 
     def __init__(self) -> None:
         self.children: dict[str, _Edge] = {}
         self.category: FieldCategory | None = None
+        self.subtree_category: FieldCategory | None = None
+        # 该节点是否由一条“对象数组”边到达（数组元素节点）。
+        self.is_array_node: bool = False
 
 
 class _Edge:
@@ -136,6 +155,44 @@ class _Edge:
     def __init__(self, node: "_Node", is_array: bool) -> None:
         self.node = node
         self.is_array = is_array
+
+
+#: 仅保护 trie 重编译发布（进程生命周期内至多发生极少次）。
+_COMPILE_LOCK = threading.Lock()
+
+
+def _propagate_subtree_category(root: "_Node") -> None:
+    """后序遍历：把“后代含敏感声明”的代表类别汇总到每个节点。
+
+    节点自身有 ``category`` 时以自身为准（叶子判定精确）；否则取所有出边
+    子节点子树类别中按枚举序最靠前的一个，保证同一结构编译结果确定、
+    与 dict 迭代顺序无关。数组边与对象边一样参与传播（数组元素位置填错
+    单值时同样要按元素结构的敏感级别处理）。
+    """
+    # 共享子节点去重（同一节点可能经多个别名边到达）。
+    visited: set[int] = set()
+
+    def walk(node: "_Node") -> FieldCategory | None:
+        if id(node) in visited:
+            return node.subtree_category
+        visited.add(id(node))
+        candidates: list[FieldCategory] = []
+        seen_children: set[int] = set()
+        for edge in node.children.values():
+            child = edge.node
+            if id(child) in seen_children:
+                continue
+            seen_children.add(id(child))
+            child_sub = walk(child)
+            if child_sub is not None:
+                candidates.append(child_sub)
+        if node.category is not None:
+            node.subtree_category = node.category
+        elif candidates:
+            node.subtree_category = min(candidates, key=lambda c: c.value)
+        return node.subtree_category
+
+    walk(root)
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +310,12 @@ class SensitivityPolicy:
     # -- 编译 -----------------------------------------------------------
 
     def _ensure_compiled(self) -> _Node:
+        # 编译结果是不可变快照：加锁只保护“重编译发布”这一步，读多写少，
+        # 避免并发首次使用时看到 subtree 传播尚未完成的半成品 trie。
         if self._dirty:
-            self._compile()
+            with _COMPILE_LOCK:
+                if self._dirty:
+                    self._compile()
         return self._trie_root
 
     def _compile(self) -> None:
@@ -276,10 +337,13 @@ class SensitivityPolicy:
                         break
                 if shared is None:
                     shared = _Edge(_Node(), is_array)
+                if is_array:
+                    shared.node.is_array_node = True
                 for label in labels:
                     node.children[label] = shared
                 node = shared.node
             node.category = category
+        _propagate_subtree_category(root)
         self._trie_root = root
         self._dirty = False
 
@@ -433,17 +497,87 @@ def normalize_payload_for_model(
 def policy_for_request(request: Any) -> SensitivityPolicy | None:
     """按请求路由声明的 body 模型解析生效策略。
 
-    从 ``route.dependant.body_params`` 的字段注解反查绑定关系；
-    路由未声明资料模型时返回 None，自动退化为基线规则。
+    优先返回模型显式绑定的场景策略（如企业开通）；未显式绑定但 body 是
+    Pydantic 模型（如 /login）时，按基线凭据/个人信息规则为该模型**合成**
+    一份等价策略——这样整体 body 被错填成单值等“结构位置错误”也能被 trie
+    子树判定覆盖，而不是在无路径可走时漏过原始值；路由完全没声明 body
+    模型时返回 None，调用方继续按裸基线规则处理。
     """
+    model_cls = _request_body_model(request)
+    if model_cls is None:
+        return None
+    explicit = _model_registry.get(model_cls)
+    if explicit is not None:
+        return explicit
+    return _baseline_policy_for_model(model_cls)
+
+
+def _request_body_model(request: Any) -> type[BaseModel] | None:
+    """从路由 body 参数注解中取出（可能的）Pydantic 模型类。"""
     route = getattr(request, "scope", {}).get("route")
     dependant = getattr(route, "dependant", None)
     for body_param in getattr(dependant, "body_params", []) or []:
         annotation = getattr(getattr(body_param, "field_info", None), "annotation", None)
-        policy = _model_registry.get(annotation)
-        if policy is not None:
-            return policy
+        model_cls = _first_model_annotation(annotation)
+        if model_cls is not None:
+            return model_cls
     return None
+
+
+def _first_model_annotation(annotation: Any) -> type[BaseModel] | None:
+    """从 ``Model`` / ``Model | None`` / ``list[Model]`` 等注解里取首个模型类。"""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    if origin is not None:
+        for arg in get_args(annotation):
+            found = _first_model_annotation(arg)
+            if found is not None:
+                return found
+    return None
+
+
+#: 未显式绑定模型的基线策略缓存（模型类 -> 合成策略）；模型类是进程内
+#: 静态声明，缓存条目数量等于未绑定的 body 模型数，有硬上界。
+_baseline_policy_cache: dict[type[BaseModel], SensitivityPolicy] = {}
+
+
+def _baseline_policy_for_model(model_cls: type[BaseModel]) -> SensitivityPolicy:
+    """按基线键名正则为模型（含嵌套）合成一份与裸基线等价的场景策略。
+
+    内省可接受写法与数组层级后，凡字段名/别名命中基线凭据或个人信息
+    正则的路径一律 mark；合成结果与 :func:`_baseline_category` 在逐键
+    遍历时的判定一致，因此正常嵌套请求脱敏结果不变，只是额外获得
+    “结构位置错填单值”时的子树覆盖能力。
+    """
+    cached = _baseline_policy_cache.get(model_cls)
+    if cached is not None:
+        return cached
+    policy = SensitivityPolicy(f"__baseline__:{model_cls.__qualname__}")
+    seen: set[int] = set()
+
+    def mark_baseline_fields(cls: type[BaseModel], prefix: tuple[str, ...]) -> None:
+        if id(cls) in seen:
+            return
+        seen.add(id(cls))
+        for attr, field in cls.model_fields.items():
+            path = prefix + (attr,)
+            category: FieldCategory | None = _baseline_category(attr)
+            if category is None:
+                for alias in _alias_names(field):
+                    category = _baseline_category(alias)
+                    if category is not None:
+                        break
+            if category is not None:
+                policy.mark(path, category)
+            sub_models, _is_array = _analyze_annotation(field.annotation)
+            for sub in sub_models:
+                mark_baseline_fields(sub, path)
+
+    mark_baseline_fields(model_cls, ())
+    policy.introspect(model_cls)
+    _baseline_policy_cache[model_cls] = policy
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -579,23 +713,104 @@ def redact_value(
 _SAFE_VALIDATION_MESSAGE = "Sensitive field failed validation; input value withheld."
 
 
-def _classify_loc(loc: Any, policy: SensitivityPolicy | None) -> FieldCategory | None:
-    """按字段定位路径判定敏感性（跳过 body 前缀与数组下标；脱离 trie 走基线）。"""
+def _classify_loc(
+    loc: Any,
+    policy: SensitivityPolicy | None,
+    *,
+    raw_input: Any = _UNSET,
+) -> FieldCategory | None:
+    """按字段定位路径判定错误明细的敏感性。
+
+    返回值为该条错误应按敏感处理时的字段类别（审计口径），否则 None。
+
+    两类命中：
+
+    1. **精确命中**：路径终点自身就是被 mark 的敏感字段（叶子类别），
+       覆盖正常嵌套、数组某一条、可选分支内的字段级失败；
+    2. **结构位置错填**：路径终点本应是一个对象/数组（其子树含敏感
+       声明），但客户端在该位置给了形状不对的值（如联系人位置直接给
+       一串手机号、法人位置给证件号、附件位置给签名 URL、整个 body
+       是一段字符、数组元素位置给单值）。此时无法继续下钻定位到字段，
+       但该位置承载的结构里含敏感资料，原始值一律按敏感剥离。
+
+    形状正常（dict 在对象位、list 在数组位）时即使落在含敏感字段的
+    结构上也不在此命中——结构能继续下钻，具体敏感与否交给字段级错误
+    逐条精确判定，非敏感字段错误因此仍可回显 input。
+    """
     node = policy._ensure_compiled() if policy is not None else None
-    category: FieldCategory | None = None
+
+    exact: FieldCategory | None = None
+    cur = node
+    last_edge_is_array = False
+    string_segments: list[str] = []
     for segment in loc:
-        if isinstance(segment, int) or segment == "body":
+        if segment == "body":
             continue
-        edge = node.children.get(normalize_key(segment)) if node is not None else None
+        if isinstance(segment, int):
+            # 数组下标：保持当前节点（数组元素与数组边共享子结构），
+            # 并记录“上一步走到了数组元素位置”。
+            last_edge_is_array = True
+            continue
+        last_edge_is_array = False
+        string_segments.append(segment)
+        edge = cur.children.get(normalize_key(segment)) if cur is not None else None
         if edge is not None:
-            node = edge.node
-            if node.category is not None:
-                category = node.category
-            continue
-        baseline = _baseline_category(segment)
-        if baseline is not None:
-            category = baseline
-    return category
+            cur = edge.node
+            last_edge_is_array = edge.is_array
+            if cur.category is not None:
+                exact = cur.category
+        else:
+            baseline = _baseline_category(segment)
+            if baseline is not None:
+                exact = baseline
+            cur = None
+
+    if exact is not None:
+        return exact
+
+    # loc 仅为 ("body",)：整个请求体本身错形（整体 body 是一段字符等）。
+    if not string_segments:
+        target_node = node
+        position_is_array = False
+    else:
+        target_node = cur
+        position_is_array = last_edge_is_array
+
+    if (
+        target_node is not None
+        and target_node.subtree_category is not None
+        and raw_input is not _UNSET
+        and not _input_shape_matches_position(
+            raw_input, target_node, position_is_array, string_segments
+        )
+    ):
+        return target_node.subtree_category
+    return None
+
+
+def _input_shape_matches_position(
+    raw_input: Any,
+    node: _Node,
+    position_is_array: bool,
+    string_segments: list[str],
+) -> bool:
+    """判断错误输入的形状是否与 loc 终点期望的结构位置相符。
+
+    相符（返回 True）表示还能按结构继续下钻，字段级错误自行精确判定；
+    不符（返回 False）表示客户端把结构位置错填成了别的形状，该位置
+    子树又含敏感声明，原始输入必须整体按敏感处理。
+    """
+    # 整个 body 位置：策略存在即说明期望模型对象（Mapping）。
+    if not string_segments:
+        return isinstance(raw_input, Mapping)
+    if position_is_array or node.is_array_node:
+        return _is_sequence(raw_input)
+    # 对象位置（有子字段的节点）：期望 dict；给标量/list 都属错形。
+    if node.children:
+        return isinstance(raw_input, Mapping)
+    # 叶子标量位置：任何标量都算形状相符，具体规则（长度/格式）由
+    # 字段级错误与精确路径判定处理。
+    return not isinstance(raw_input, Mapping | list | tuple | set | frozenset)
 
 
 def _collect_sensitive_values(
@@ -627,7 +842,18 @@ def _collect_sensitive_values(
                     _collect_sensitive_values(item, target, depth + 1, out)
                 elif _is_sequence(item):
                     for element in list(item)[:_MAX_ITEMS]:
-                        _collect_sensitive_values(element, target, depth + 1, out)
+                        if target.subtree_category is not None and not isinstance(
+                            element, Mapping
+                        ):
+                            # 数组元素位置本应是（含敏感字段的）对象，却给了
+                            # 标量等错形值：该值按敏感收集，供 msg 全局清扫。
+                            _add_scalar(element, out, min_length=1)
+                        else:
+                            _collect_sensitive_values(element, target, depth + 1, out)
+                elif target.subtree_category is not None:
+                    # 对象位置本应是（含敏感字段的）dict，却给了标量/list：
+                    # 无论长短都收集，避免短证件号等因长度阈值漏清扫。
+                    _add_scalar(item, out, min_length=1)
             else:
                 category = _baseline_category(key)
                 if category is not None:
@@ -636,18 +862,27 @@ def _collect_sensitive_values(
                     _collect_sensitive_values(item, None, depth + 1, out)
     elif _is_sequence(value):
         for element in list(value)[:_MAX_ITEMS]:
-            _collect_sensitive_values(element, node, depth + 1, out)
+            if (
+                node is not None
+                and node.subtree_category is not None
+                and not isinstance(element, Mapping)
+            ):
+                _add_scalar(element, out, min_length=1)
+            else:
+                _collect_sensitive_values(element, node, depth + 1, out)
 
 
-def _add_scalar(item: Any, out: set[str]) -> None:
+def _add_scalar(item: Any, out: set[str], *, min_length: int = 4) -> None:
     if isinstance(item, str):
         text = item
     elif isinstance(item, int | float | bool):
         text = str(item)
     else:
         return
-    # 过短值不做全局清扫，避免误伤正常文案；掩码不漏判由路径判定保证。
-    if len(text) >= 4:
+    # 常规叶子只收集较长值，避免误伤正常文案；错填到敏感结构位置的值
+    # （min_length=1）不受长度阈值限制——掩码不漏判由路径/子树判定保证，
+    # 这里的集合仅用于错误 msg 的全局替换清扫。
+    if len(text) >= min_length:
         out.add(text)
 
 
@@ -671,12 +906,20 @@ def scrub_validation_errors(
     sensitive_values: set[str] = set()
     if body is not None:
         _collect_sensitive_values(body, root, 0, sensitive_values)
+        # 整个请求体被错填成标量（body 位置期望模型对象）：loc 判定会
+        # 剥离该错误的 input；这里同步把根标量纳入 msg 全局清扫集合。
+        if (
+            root is not None
+            and root.subtree_category is not None
+            and not isinstance(body, Mapping)
+        ):
+            _add_scalar(body, sensitive_values, min_length=1)
 
     counts: dict[FieldCategory, int] = {}
     cleaned: list[dict[str, Any]] = []
     for error in errors:
         loc = error.get("loc", ())
-        category = _classify_loc(loc, policy)
+        category = _classify_loc(loc, policy, raw_input=error.get("input", _UNSET))
         if category is not None:
             counts[category] = counts.get(category, 0) + 1
             safe = {
@@ -719,3 +962,4 @@ def reset_sensitivity() -> None:
     """
     _policies.clear()
     _model_registry.clear()
+    _baseline_policy_cache.clear()

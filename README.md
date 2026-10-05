@@ -25,6 +25,7 @@ uv sync
 - `app/observability/background.py` — 后台任务 request_id 快照
 - `app/observability/http.py` — 下游调用 request_id 透传与请求体脱敏记录
 - `app/schemas.py` / `app/schemas_enterprise.py` — 登录 / 企业实名开通资料模型与敏感声明
-- `tests/` — 并发隔离 / 脱敏 / 异常映射 / 指标口径 / 企业开通场景 / 脱敏审计测试
+- `tests/` — 并发隔离 / 脱敏 / 异常映射 / 指标口径 / 企业开通场景 / 脱敏审计 /
+  敏感资料填错位置与多路日志输出计数（40 个用例）
 
 完整规则与本地验证步骤见 [docs/observability.md](docs/observability.md)。

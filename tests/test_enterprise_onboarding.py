@@ -473,12 +473,14 @@ def test_concurrent_onboarding_audit_counts_are_accurate_and_isolated(
     # 精确口径（按 contact 类别统计每请求掩码次数）：
     #   请求日志（模型序列化形态）：phone1 + email1 + phone2 = 3
     #     （第二个联系人未给 email，模型里该键为 None，不掩码也不计数）
-    #   下游调用记录日志（原始 dict 形态，email2 键存在但值为 None -> 0，
-    #     实际仍为 phone1+email1+phone2=3；真实报文里第一条含 email，
-    #     第二条 None）
-    #   -> 两条 log 事件合计 6；downstream 通道 3。
-    assert contact_log - before_contact_log == 6 * n_per_style, (
-        f"[口径不一致] contact/log 增量应为 {6 * n_per_style}，"
+    #   下游调用记录的掩码计入 downstream 通道；其 PreRedacted 快照进入
+    #     log 渲染时不再二次脱敏/计数，因此 log 通道合计仍为 3。
+    #   计数只与实际掩码有关：多挂一路日志 handler / formatter 多次渲染
+    #   同一条记录都复用 LogRecord 上的脱敏快照，计数不变（见
+    #   tests/test_misplaced_values.py 的多路输出用例）。
+    #   -> log 通道 3；downstream 通道 3。
+    assert contact_log - before_contact_log == 3 * n_per_style, (
+        f"[口径不一致] contact/log 增量应为 {3 * n_per_style}（与日志输出路数无关），"
         f"实际 {contact_log - before_contact_log}"
     )
     contact_ds = counts.get(("contact", "downstream", ""), 0)
@@ -489,7 +491,7 @@ def test_concurrent_onboarding_audit_counts_are_accurate_and_isolated(
     _log_case(
         "并发脱敏审计",
         request_id=f"{n_per_style} 并发",
-        basis="唯一探针不跨 rid；contact log 增量 6*N、downstream 增量 3*N",
+        basis="唯一探针不跨 rid；contact log/downstream 增量各 3*N，与输出路数无关",
     )
 
 
