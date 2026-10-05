@@ -121,13 +121,19 @@ class _Node:
 
     同一子结构通过多条边到达同一子节点（字段名 + 各种别名归一后均指向它）；
     ``array_edges`` 标记某条边是“对象数组”，数组每个元素都按该子结构遍历。
+
+    ``subtree_category`` 在编译期计算：本子树（含自身）任一敏感类别的确定性
+    代表（自身类别优先，否则按 :class:`FieldCategory` 定义顺序取最近后代）。
+    用于“填错位置”场景——客户端把单值直接填在对象/数组位置（如联系人位置
+    填一串手机号）时，该值按子树敏感类别整体掩码，与正常嵌套同口径。
     """
 
-    __slots__ = ("children", "category")
+    __slots__ = ("children", "category", "subtree_category")
 
     def __init__(self) -> None:
         self.children: dict[str, _Edge] = {}
         self.category: FieldCategory | None = None
+        self.subtree_category: FieldCategory | None = None
 
 
 class _Edge:
@@ -280,8 +286,39 @@ class SensitivityPolicy:
                     node.children[label] = shared
                 node = shared.node
             node.category = category
+        _compute_subtree_categories(root)
         self._trie_root = root
         self._dirty = False
+
+
+#: 子树代表类别的确定性选取顺序（FieldCategory 定义顺序）。
+_CATEGORY_ORDER = list(FieldCategory)
+
+
+def _compute_subtree_categories(root: _Node) -> None:
+    """后序遍历 trie，为每个节点填充 ``subtree_category``（确定性、幂等）。
+
+    多条边可共享同一子节点（别名归一），用 memo 避免重复计算；trie 由有限
+    路径编译而来，不存在环。
+    """
+    memo: dict[int, FieldCategory | None] = {}
+
+    def resolve(node: _Node) -> FieldCategory | None:
+        if id(node) in memo:
+            return memo[id(node)]
+        best = node.category
+        for edge in node.children.values():
+            child = resolve(edge.node)
+            if child is not None and (
+                best is None
+                or _CATEGORY_ORDER.index(child) < _CATEGORY_ORDER.index(best)
+            ):
+                best = child
+        node.subtree_category = best
+        memo[id(node)] = best
+        return best
+
+    resolve(root)
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +510,21 @@ def _redact(
     if depth >= _MAX_DEPTH:
         return REDACTED
 
+    # 填错位置的单值：本应是对象/数组的敏感子树位置被直接填了标量
+    # （如联系人位置填手机号、附件位置填带签名 URL）。该值按子树代表类别
+    # 整体掩码，与正常嵌套时同口径。depth == 0 的裸标量不在此判定
+    # （错误明细里非敏感字段的标量 input 会以根节点重入，不能误掩码）。
+    if (
+        depth > 0
+        and node is not None
+        and node.subtree_category is not None
+        and isinstance(value, str | int | float | bool)
+    ):
+        # 已是掩码标记的值保持原样，不重复掩码、不重复计数。
+        if value == REDACTED:
+            return REDACTED
+        return _mask(counts, node.subtree_category)
+
     if isinstance(value, BaseModel):
         policy = policy_for_model(type(value))
         try:
@@ -513,7 +565,9 @@ def _redact(
                         else _redact_sequence(item, target, depth + 1, counts)
                     )
                 else:
-                    result[str_key] = item
+                    # 标量（含 None）：交给 _redact 判定——若该位置是含敏感
+                    # 子树的容器（填错位置的单值），会被整体掩码；否则原样保留。
+                    result[str_key] = _redact(item, target, depth + 1, counts)
             else:
                 category = _baseline_category(key)
                 if category is not None:
@@ -580,9 +634,18 @@ _SAFE_VALIDATION_MESSAGE = "Sensitive field failed validation; input value withh
 
 
 def _classify_loc(loc: Any, policy: SensitivityPolicy | None) -> FieldCategory | None:
-    """按字段定位路径判定敏感性（跳过 body 前缀与数组下标；脱离 trie 走基线）。"""
+    """按字段定位路径判定敏感性（跳过 body 前缀与数组下标；脱离 trie 走基线）。
+
+    除叶子自身类别外，还包括“填错位置”兜底：当整条 loc 都能解析进 trie
+    （落在一个含敏感后代的容器节点上，如 ``contacts`` / ``legal_representative``
+    / 根 ``body``），说明该位置本应是一个含敏感资料的对象/数组，而实际提交的
+    是无法对应到具体字段的单值——按子树代表类别判定为敏感，输入一律不外泄。
+    loc 中有任何一段未命中 trie（如 ``enterprise_name`` 这种非敏感字段），
+    不做子树兜底，避免误伤非敏感字段的输入回显。
+    """
     node = policy._ensure_compiled() if policy is not None else None
     category: FieldCategory | None = None
+    fully_resolved = True
     for segment in loc:
         if isinstance(segment, int) or segment == "body":
             continue
@@ -592,9 +655,12 @@ def _classify_loc(loc: Any, policy: SensitivityPolicy | None) -> FieldCategory |
             if node.category is not None:
                 category = node.category
             continue
+        fully_resolved = False
         baseline = _baseline_category(segment)
         if baseline is not None:
             category = baseline
+    if category is None and fully_resolved and node is not None:
+        category = node.subtree_category
     return category
 
 
@@ -604,8 +670,19 @@ def _collect_sensitive_values(
     depth: int,
     out: set[str],
 ) -> None:
-    """收集所有敏感叶子的标量字符串形式（用于清扫错误 msg 中的回显）。"""
+    """收集所有敏感叶子的标量字符串形式（用于清扫错误 msg 中的回显）。
+
+    填错位置的单值（对象/数组位置直接填标量）同样按子树敏感类别收集，
+    保证它也不会出现在任何错误消息文本里。
+    """
     if depth >= _MAX_DEPTH:
+        return
+    if (
+        node is not None
+        and node.subtree_category is not None
+        and isinstance(value, str | int | float | bool)
+    ):
+        _add_scalar(value, out)
         return
     if isinstance(value, BaseModel):
         policy = policy_for_model(type(value))
@@ -628,6 +705,9 @@ def _collect_sensitive_values(
                 elif _is_sequence(item):
                     for element in list(item)[:_MAX_ITEMS]:
                         _collect_sensitive_values(element, target, depth + 1, out)
+                else:
+                    # 填错位置的标量：由递归顶部的子树敏感子句判定收集。
+                    _collect_sensitive_values(item, target, depth + 1, out)
             else:
                 category = _baseline_category(key)
                 if category is not None:

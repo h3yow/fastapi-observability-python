@@ -10,8 +10,8 @@
 - 核心代码：`app/context.py`、`app/observability/`（含 `sensitivity.py`
   场景策略/脱敏/审计、`codes.py` 稳定错误码）
 - 企业实名开通场景：`app/schemas_enterprise.py`、路由 `POST /enterprise/onboarding`
-- 测试：`tests/`（33 个用例，覆盖并发隔离、脱敏、异常映射、指标口径、
-  企业开通场景与脱敏审计）
+- 测试：`tests/`（48 个用例，覆盖并发隔离、脱敏、异常映射、指标口径、
+  企业开通场景、填错位置防护与脱敏审计）
 
 ---
 
@@ -218,6 +218,27 @@ normalize_key(s) = s.lower().replace("_", "").replace("-", "")
 - 真实发给下游的业务报文**不脱敏**（下游需要原始资料），脱敏只发生在
   “下游调用的日志记录副本”上；测试同时断言“记录无原始值”与“真实报文含原始值”。
 
+### 3.4.1 填错位置的单值（对象/数组位置被直接填成标量）
+
+客户端有时把本该是对象/数组的位置直接填成一个单值：联系人位置填一串
+手机号、法人/银行账户位置填一个证件号/账号、附件位置填一段带签名的下载
+地址，甚至整个请求体就是一段字符。这些位置声明的子树里含有敏感字段，
+填进来的单值**按敏感资料处理**，与正常嵌套时同口径：
+
+- **判定依据**：场景策略编译 trie 时为每个节点预计算“子树敏感类别”
+  （自身类别优先，否则按字段类别定义顺序取最近后代，确定性选择）。
+  递归脱敏与 422 明细清洗遇到“落在含敏感后代容器节点上的标量”
+  （顶层、嵌套对象、数组某一条、可选分支、根 `body` 均覆盖）时，
+  按该子树类别整体掩码；
+- **不外泄**：这类单值不会出现在 422 响应明细、服务端日志或错误统计中；
+  错误明细只保留 `loc`/`type` 与 `redacted: true`，前端仍能定位到
+  填错的位置与违反的规则（如 `list_type`/`model_attributes_type`）；
+- **不误伤**：`loc` 中有任何一段未命中 trie（如 `enterprise_name` 这类
+  非敏感字段本身的校验失败）不做子树兜底，非敏感字段的 `input` 继续原样
+  回显；可选分支缺省 `None` 依旧保持 `None`、不计数；
+- **口径一致**：同一份请求在响应、日志、错误统计中使用同一份清洗结果/
+  同一套判定，不会出现一处掩码一处明文。
+
 ### 3.5 脱敏审计计数（低基数，不记值、不记路径）
 
 新增 Prometheus 计数器 `masked_inputs_total`，在 `GET /metrics` 暴露：
@@ -237,12 +258,17 @@ masked_inputs_total{field_category="contact",output_channel="log",error_code=""}
 - 计数含义是“敏感输入**被掩码的次数**”：同一份敏感体出现在多个输出事件
   （如请求日志 + 下游调用记录）会分别计数，因为它们是独立的掩码动作；
   同一事件内已掩码的载荷经 `PreRedacted` 包装透传，**不会二次计数**；
+- **与日志输出路数、渲染次数无关**：日志的脱敏发生在记录首次渲染时，
+  结果缓存在该条 `LogRecord` 上（`JsonFormatter`），多挂一路 handler、
+  或同一记录被重复渲染，都复用首次结果——一条日志记录的掩码只发生、
+  只计数一次（测试以 1/2/3 路输出与同一记录 3 次渲染验证计数不变）；
 - **绝不记录原始值、字段名或字段路径**，因此无法从指标反推任何个人信息；
 - 维度组合数有硬上界 `4 × 3 × 错误码数`，字段和别名组合增多、请求条数增多
   都不会让维度增长（测试以 40 个含不同值/别名的请求验证标签数不超过上界）；
 - 判定是锁外的纯内存 trie 遍历（每字段 O(路径深度)），仅在按类别聚合计数后
   一次进入全局锁，临界区为常数次自增；测试验证 19 个联系人的请求单次脱敏
-  仍在毫秒级，16 线程 × 50 次并发计数精确无丢失。
+  仍在毫秒级，16 线程 × 50 次并发计数精确无丢失，24 并发“填错位置”
+  请求的审计增量精确等于请求数。
 
 ### 3.6 日志与响应的边界
 
@@ -290,6 +316,7 @@ masked_inputs_total{field_category="contact",output_channel="log",error_code=""}
 | 字段是否敏感 | 保留内容 | 去除/替换内容 |
 |---|---|---|
 | **敏感字段**（路径命中策略/基线） | `loc`（字段定位，含数组下标）、`type`（失败规则）、`url`，并加 `"redacted": true` | 删除 `input` 与 `ctx`；`msg` 统一替换为不含输入的安全说明 `Sensitive field failed validation; input value withheld.` |
+| **填错位置的单值**（对象/数组位置填了标量，含根 `body`） | 同上：`loc` 定位到填错的位置、`type` 表明期望的结构（如 `list_type`）、`redacted: true` | 同上：输入一律不外泄（见 3.4.1） |
 | **非敏感字段** | 完整保留 `loc`/`type`/`msg`/`url`/`input`/`ctx`，前端可据此定位并回显用户输入 | 仅当 `input`/`ctx` 内部嵌套了敏感值时才掩码；`msg` 若回显了任何敏感标量也会被清扫 |
 
 要点：
@@ -383,6 +410,15 @@ curl -s -X POST http://127.0.0.1:8000/enterprise/onboarding \
        "contacts":[{"name":"李四","phone":"138"}],
        "bank_account":{"account_name":"ACME","account_number":"12"}}'
 
+# 3d) 填错位置：联系人位置直接填一串手机号（本应是对象数组）。
+#     响应明细只给 loc/type/redacted，响应、日志、指标里都搜不到该手机号；
+#     同请求的非敏感字段错误（enterprise_name 过短）仍回显 input。
+curl -s -X POST http://127.0.0.1:8000/enterprise/onboarding \
+  -H 'Content-Type: application/json' -H 'X-Request-ID: ent-demo-423' \
+  -d '{"enterprise_name":"A","credit_code":"91110000XXXXXXXXX1",
+       "legal_representative":{"name":"张三","idNumber":"110101199001011234"},
+       "contacts":"13800138000"}'
+
 # 4) 校验失败 / 未匹配路由 / 内部异常的稳定错误码
 curl -s -X POST http://127.0.0.1:8000/login -H 'Content-Type: application/json' -d '{"username":"bob"}'
 curl -s http://127.0.0.1:8000/no/such/path/12345
@@ -408,6 +444,12 @@ curl -s http://127.0.0.1:8000/metrics | grep masked_inputs_total
   `credit_code` 的错误带原始 `input`（`"A"`/`"short"`），而 `idNumber`、
   `contacts[0].phone`、`account_number` 的错误只有 `loc/type/redacted`，
   响应与日志里都搜不到 `123`、`138` 等敏感输入；
+- 3d 的 422 响应：`contacts` 位置的错误为
+  `{"type":"list_type","loc":["body","contacts"],"redacted":true,...}`，
+  无 `input`；`enterprise_name` 的错误仍带 `"input":"A"`；响应、服务端日志
+  与 `/metrics` 中都搜不到 `13800138000`，而
+  `masked_inputs_total{field_category="contact",...,error_code="VALIDATION_FAILED"}`
+  在 `response` 与 `log` 两个通道各 +1（与日志输出路数无关）；
 - `/metrics` 中 `masked_inputs_total` 形如
   `masked_inputs_total{field_category="contact",output_channel="log",error_code=""} N`，
   标签值只能是 4 个类别、3 个通道与有限错误码。
@@ -421,7 +463,7 @@ curl -s http://127.0.0.1:8000/metrics | grep masked_inputs_total
 - `-s` 会打印每个用例的**输入、关联标识与判定依据**（`[用例] ...` 行）；
 - 断言失败消息均带可区分原因（期望/实际值与场景说明）。
 
-测试分布（共 33 个用例）：
+测试分布（共 48 个用例）：
 
 - `tests/test_concurrency.py`：50 并发标识隔离、并发生成唯一性、
   沿用/替换 9 个边界、并发日志关联、后台任务、下游透传、异常响应关联；
@@ -436,7 +478,13 @@ curl -s http://127.0.0.1:8000/metrics | grep masked_inputs_total
   30 并发请求计数不丢不串（唯一探针跨 request_id 检测）；
 - `tests/test_mask_audit.py`（6 个）：三通道同输入判定逐字节一致、
   不同写法判定一致、基线规则兜底、40 请求标签组合不超封闭上界（维度爆炸）、
-  19 联系人请求脱敏毫秒级（性能回退）、16×50 纯并发计数精确。
+  19 联系人请求脱敏毫秒级（性能回退）、16×50 纯并发计数精确；
+- `tests/test_misplaced_sensitive_input.py`（15 个）：填错位置全集
+  （顶层/嵌套对象/数组某一条/可选分支/混合数组/整个请求体是字符）——
+  响应、日志、指标均无原始值，敏感错误可定位（loc/type/redacted），
+  同请求非敏感字段错误仍回显 input，日志明细与响应明细逐字节一致；
+  审计计数与日志输出路数（1/2/3 路）和渲染次数无关；
+  24 并发填错请求的唯一探针不泄露、不串 request_id、计数精确。
 
 新用例的失败断言带三类可区分前缀：`[泄露]`（原始值出现在观测面）、
 `[口径不一致]`（不同通道/写法/路径的判定或计数对不上）、

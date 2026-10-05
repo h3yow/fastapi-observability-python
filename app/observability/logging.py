@@ -32,12 +32,15 @@ _MAX_DEPTH = 6
 _MAX_ITEMS = 100
 
 #: logging 记录自带的标准属性，渲染 extra 字段时排除。
+#: ``_observability_redacted_extras`` 是脱敏结果缓存（见 JsonFormatter），
+#: 同样不作为业务字段渲染。
 _RESERVED_ATTRS = frozenset(
     {
         "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
         "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
         "created", "msecs", "relativeCreated", "thread", "threadName",
         "processName", "process", "taskName", "request_id",
+        "_observability_redacted_extras",
     }
 )
 
@@ -78,8 +81,34 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
+#: 记录在 LogRecord 上的“已脱敏 extra 字段”缓存属性名。
+#:
+#: 脱敏审计计数发生在脱敏动作本身；同一条日志记录可能被多个 handler
+#: 渲染（多路日志输出），或被同一路渲染多次。若每次渲染都重新脱敏，
+#: 审计计数会随输出路数翻倍。这里把首次脱敏结果缓存在记录上，后续
+#: 渲染直接复用——一条记录的掩码动作只发生、只计数一次，与输出路数、
+#: 渲染次数无关。标准 logging 中一条记录由创建它的线程顺序经过各
+#: handler，不存在并发渲染同一记录的场景。
+_REDACTED_CACHE_ATTR = "_observability_redacted_extras"
+
+
 class JsonFormatter(logging.Formatter):
-    """将日志记录渲染为单行 JSON，extra 字段递归脱敏。"""
+    """将日志记录渲染为单行 JSON，extra 字段递归脱敏。
+
+    脱敏结果按记录缓存（见 :data:`_REDACTED_CACHE_ATTR`）：多路 handler
+    或重复渲染复用首次脱敏结果，脱敏审计计数与渲染次数无关。
+    """
+
+    def _redacted_extras(self, record: logging.LogRecord) -> dict[str, Any]:
+        cached = getattr(record, _REDACTED_CACHE_ATTR, None)
+        if cached is None:
+            cached = {
+                key: redact_value(value)
+                for key, value in record.__dict__.items()
+                if key not in _RESERVED_ATTRS
+            }
+            setattr(record, _REDACTED_CACHE_ATTR, cached)
+        return cached
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
@@ -91,10 +120,10 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "request_id": getattr(record, "request_id", None),
         }
-        for key, value in record.__dict__.items():
-            if key in _RESERVED_ATTRS or key in payload:
+        for key, value in self._redacted_extras(record).items():
+            if key in payload:
                 continue
-            payload[key] = redact_value(value)
+            payload[key] = value
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
